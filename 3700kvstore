@@ -1,0 +1,370 @@
+#!/usr/bin/env python3
+
+import argparse
+import socket
+import json
+import random
+import threading
+
+BROADCAST = "FFFF"
+
+LEADER = 'leader'
+FOLLOWER = 'follower'
+CANDIDATE = 'candidate'
+
+OK_TYPE = 'ok'
+FAIL_TYPE = 'fail'
+REDIRECT_TYPE = 'redirect'
+
+TYPE = 'type'
+SRC = 'src'
+DST = 'dst'
+GET = 'get'
+PUT = 'put'
+CRASH = 'crash'
+
+
+class Replica:
+    def __init__(self, port, id, others):
+        self.port = port
+        self.id = id
+        self.others = others
+        self.state = FOLLOWER
+        self.term = 0
+        self.voted_for = None
+        self.leader = 'FFFF'
+        self.election_timeout = None
+        self.election_timer = None
+        self.votes = 0
+        self.database = {}
+        self.ack_msg = {}
+        self.acks_pending = {}
+        self.log = []
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('localhost', 0))
+        print("Replica %s starting up" % self.id, flush=True)
+        hello = {SRC: self.id, DST: BROADCAST, "leader": BROADCAST, TYPE: "hello"}
+        self.send(hello)
+        print("Sent hello message: %s" % hello, flush=True)
+        self.reset_election_timeout()
+
+    def send(self, message):
+        """
+        Send a message
+        :param message: The message to be sent
+        """
+        self.socket.sendto(json.dumps(message).encode('utf-8'), ('localhost', self.port))
+
+    def reset_election_timeout(self):
+        """
+        Reset the election timeout
+        """
+        self.election_timeout = random.uniform(1, 10)  # Set a random election timeout between 1 and 3 seconds
+        self.start_election_timer()
+
+    def start_election_timer(self):
+        """
+        Start the election timer
+        """
+        self.stop_election_timer()
+        self.election_timer = threading.Timer(self.election_timeout, self.start_election)
+        self.election_timer.start()
+
+    def stop_election_timer(self):
+        """
+        Stop the election timer
+        """
+        if self.election_timer:
+            self.election_timer.cancel()  # If the timer is active, stop the timer
+
+    def start_election(self):
+        """
+        Start an election
+        """
+        # If the replica is a follower, request a vote
+        if self.state == FOLLOWER:
+            self.transition_to_candidate()
+            self.request_votes()
+
+    def transition_to_leader(self):
+        """
+        Transition this replica to a leader
+        """
+        self.state = LEADER
+        self.leader = self.id
+        self.votes = 0
+        self.voted_for = None
+        print(f"Replica {self.id} transitioned to LEADER in term {self.term}")
+        self.broadcast_heartbeat()
+
+    def transition_to_candidate(self):
+        """
+        Transition this replica to a candidate
+        """
+        self.state = CANDIDATE
+        self.term += 1
+        self.voted_for = self.id
+        self.votes = 1
+        print(f"Replica {self.id} transitioned to CANDIDATE in term {self.term}")
+
+    def request_votes(self):
+        """
+        To request votes
+        """
+        for other in self.others:
+            vote_request = {
+                SRC: self.id,
+                DST: other,
+                TYPE: 'request_vote',
+                LEADER: self.leader,
+                'term': self.term,
+                'candidate_id': self.id,
+                'last_log_index': 0,
+                'last_log_term': 0,
+            }
+            self.send(vote_request)
+
+    def handle_vote_request(self, msg):
+        """
+        Process an incoming vote request
+        :param msg: The vote request message received
+        """
+        if msg['term'] >= self.term:
+            if msg['term'] > self.term:
+                self.voted_for = None
+            self.term = msg['term']
+            self.state = FOLLOWER
+            self.reset_election_timeout()
+
+            if self.voted_for is None or self.voted_for == msg['candidate_id']:
+                self.voted_for = msg['candidate_id']
+                vote_granted = True
+            else:
+                vote_granted = False
+        else:
+            vote_granted = False
+
+        vote_response = {
+            SRC: self.id,
+            DST: msg[SRC],
+            LEADER: self.leader,
+            'term': self.term,
+            TYPE: 'vote_response',
+            'vote_granted': vote_granted,
+        }
+        self.send(vote_response)
+
+    def handle_vote_response(self, msg):
+        """
+        Handle a vote response message from the other replica
+        :param msg: The vote response message received
+        """
+        if msg['term'] > self.term:
+            self.term = msg['term']
+            self.state = FOLLOWER
+            self.voted_for = None
+            self.reset_election_timeout()
+        elif msg['term'] == self.term and msg['vote_granted']:
+            self.votes += 1
+            if self.votes > len(self.others) // 2:
+                self.transition_to_leader()
+        else:
+            pass
+
+    def broadcast_heartbeat(self):
+        """
+        Broadcast heartbeat to other replicas to let them know the leader is still active
+        """
+        for other in self.others:
+            heartbeat = {
+                SRC: self.id,
+                DST: other,
+                TYPE: 'heartbeat',
+                'term': self.term,
+                'leader': self.id,
+            }
+            self.send(heartbeat)
+
+    def handle_heartbeat(self, msg):
+        """
+        Resets the election timer id the incoming msg's term is greater than the replica's
+        :param msg: Message from other replica
+        """
+        if msg['term'] >= self.term:
+            self.term = msg['term']
+            self.state = FOLLOWER
+            self.leader = msg['leader']
+            self.voted_for = None
+            self.reset_election_timeout()
+
+    def redirect_client(self, msg):
+        """
+        Redirect client if the replica is not the leader
+        :param msg: Message from client to redirect
+        """
+        redirect_msg = {
+            SRC: self.id,
+            DST: msg[SRC],
+            LEADER: self.leader,
+            TYPE: REDIRECT_TYPE,
+            'MID': msg['MID']
+        }
+        self.send(redirect_msg)
+
+    def get_msg(self, msg):
+        """
+        Sends get msg
+        :param msg: Get msg from client
+        """
+        if self.id == self.leader:
+            self.send_get_response('ok', msg)
+        else:
+            self.redirect_client(msg)
+
+    def put_msg(self, msg):
+        """
+        Puts the given message inside the database and sends out the keys to other replicas
+        :param msg: Put msg from client
+        """
+
+        if self.id == self.leader:
+            key = msg.get('key')
+            value = msg.get('value')
+            self.database[key] = value
+            for other in self.others:
+                new_msg = {SRC: self.id,
+                           DST: other,
+                           LEADER: self.leader,
+                           TYPE: 'keys',
+                           'key': key,
+                           'value': value
+                           }
+                self.acks_pending[key] = value
+                self.send(new_msg)
+
+            self.send_response('ok', msg)
+        else:
+            self.redirect_client(msg)
+
+    def receive_keys(self, msg):
+        """
+        update the database in response to the leader sending out the curr log/entries
+        :param msg: The message from which to extract the key and value from
+        """
+        new_msg = {
+            SRC: self.id,
+            DST: msg[SRC],
+            LEADER: self.leader,
+            TYPE: 'ack',
+            'key': msg.get('key'),
+            'value': msg.get('value')
+        }
+        self.database[msg["key"]] = msg['value']
+
+    def handle_key_response(self, msg):
+        """
+        Update the datastore!
+        :param msg: The message from which to extract the key and value from
+        """
+        self.ack_msg[msg["key"]] = msg['value']
+
+    def send_response(self, msg_type, msg):
+        """
+        Send a response to a put message to the client
+        :param msg_type: The type of the message to be sent
+        :param msg: The put message to be forwarded
+        """
+        new_msg = {SRC: self.id, DST: msg[SRC], LEADER: self.leader, TYPE: msg_type, 'MID': msg['MID']}
+        self.send(new_msg)
+
+    def send_get_response(self, msg_type, msg):
+        """
+        Send get responses to client
+        :param msg_type: The type of the message to be sent
+        :param msg: The get message to be forwarded
+        """
+        if msg.get('key') in self.database:
+            new_msg = {
+                SRC: self.id,
+                DST: msg[SRC],
+                LEADER: self.leader,
+                TYPE: msg_type,
+                'MID': msg['MID'],
+                'value': self.database[msg.get("key")]
+            }
+            self.send(new_msg)
+        else:
+            new_msg = {
+                SRC: self.id,
+                DST: msg[SRC],
+                LEADER: self.leader,
+                TYPE: msg_type,
+                'MID': msg['MID'],
+                'value': ""
+            }
+            self.send(new_msg)
+
+    # def send_append_entries(self):
+    #     """
+    #     Send all entries to the replicas
+    #     """
+    #     for other in self.others:
+    #         append_entries_msg = {
+    #             SRC: self.id,
+    #             DST: other,
+    #             TYPE: 'append_entries',
+    #             'term': self.term,
+    #             'leader': self.id,
+    #             'entries': []
+    #         }
+    #         self.send(append_entries_msg)
+
+    def handle_requests(self, msg):
+        """
+        Handle requests from the replicas
+        :param msg: The incoming request message to be processed
+        """
+        if self.state == LEADER:  # only respond to get and put messages if it's a leader
+            if msg.get(TYPE) == GET:
+                self.get_msg(msg)
+            elif msg.get(TYPE) == PUT:
+                self.put_msg(msg)
+            elif msg.get(TYPE) == CRASH:
+                pass
+            elif msg.get(TYPE) == 'keys':
+                self.receive_keys(msg)
+            # elif msg.get(TYPE) == "append_entries":
+            #     self.send_append_entries()
+
+        elif msg.get(TYPE) == 'keys':
+            self.receive_keys(msg)
+        elif msg.get(TYPE) == GET or msg.get(TYPE) == PUT:
+            self.redirect_client(msg)
+        elif msg.get(TYPE) == 'request_vote':
+            self.handle_vote_request(msg)
+        elif msg.get(TYPE) == 'vote_response':
+            self.handle_vote_response(msg)
+        elif msg.get(TYPE) == 'heartbeat':
+            self.handle_heartbeat(msg)
+        else:
+            self.reset_election_timeout()
+
+    def run(self):
+        """
+        Run the simulator
+        """
+        while True:
+            data, addr = self.socket.recvfrom(65535)
+            msg = json.loads(data.decode('utf-8'))
+            print("Received message '%s'" % (msg,), flush=True)
+            self.handle_requests(msg)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='run a key-value store')
+    parser.add_argument('port', type=int, help="Port number to communicate")
+    parser.add_argument('id', type=str, help="ID of this replica")
+    parser.add_argument('others', metavar='others', type=str, nargs='+', help="IDs of other replicas")
+    args = parser.parse_args()
+    replica = Replica(args.port, args.id, args.others)
+    replica.run()
